@@ -81,73 +81,41 @@ except Exception:
 import threading
 import queue
 
-def CanonicalUsage(*args, **kwargs):
-    from agent.usage_pricing import CanonicalUsage as _CanonicalUsage
-
-    return _CanonicalUsage(*args, **kwargs)
-
-
-def estimate_usage_cost(*args, **kwargs):
-    from agent.usage_pricing import estimate_usage_cost as _estimate_usage_cost
-
-    return _estimate_usage_cost(*args, **kwargs)
-
-
-def format_duration_compact(*args, **kwargs):
-    seconds = float(args[0] if args else kwargs.get("seconds", 0.0))
-    if seconds < 60:
-        return f"{seconds:.0f}s"
-    minutes = seconds / 60
-    if minutes < 60:
-        return f"{minutes:.0f}m"
-    hours = minutes / 60
-    if hours < 24:
-        remaining_min = int(minutes % 60)
-        return f"{int(hours)}h {remaining_min}m" if remaining_min else f"{int(hours)}h"
-    days = hours / 24
-    return f"{days:.1f}d"
+# Lazy access to agent.usage_pricing / agent.markdown_tables — these are only
+# touched on /limits, /usage, table-rendered output, and session shutdown. We
+# avoid importing them at module load (~50ms cold) so bare interactive startup
+# stays fast. ``__getattr__`` makes the resolved symbol available as a normal
+# module attribute (preserves class identity for isinstance checks, function
+# identity for callers, no per-call wrapper overhead after first use).
+_LAZY_AGENT_USAGE_PRICING_ATTRS = {
+    "CanonicalUsage",
+    "estimate_usage_cost",
+    "format_duration_compact",
+    "format_token_count_compact",
+}
+_LAZY_AGENT_MARKDOWN_TABLES_ATTRS = {
+    "is_table_divider",
+    "looks_like_table_row",
+    "realign_markdown_tables",
+}
 
 
-def format_token_count_compact(*args, **kwargs):
-    value = int(args[0] if args else kwargs.get("value", 0))
-    abs_value = abs(value)
-    if abs_value < 1_000:
-        return str(value)
+def __getattr__(name):
+    if name in _LAZY_AGENT_USAGE_PRICING_ATTRS:
+        from agent import usage_pricing
 
-    sign = "-" if value < 0 else ""
-    units = ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"))
-    for threshold, suffix in units:
-        if abs_value >= threshold:
-            scaled = abs_value / threshold
-            if scaled < 10:
-                text = f"{scaled:.2f}"
-            elif scaled < 100:
-                text = f"{scaled:.1f}"
-            else:
-                text = f"{scaled:.0f}"
-            if "." in text:
-                text = text.rstrip("0").rstrip(".")
-            return f"{sign}{text}{suffix}"
+        value = getattr(usage_pricing, name)
+        globals()[name] = value
+        return value
+    if name in _LAZY_AGENT_MARKDOWN_TABLES_ATTRS:
+        from agent import markdown_tables
 
-    return f"{value:,}"
+        value = getattr(markdown_tables, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def is_table_divider(*args, **kwargs):
-    from agent.markdown_tables import is_table_divider as _is_table_divider
-
-    return _is_table_divider(*args, **kwargs)
-
-
-def looks_like_table_row(*args, **kwargs):
-    from agent.markdown_tables import looks_like_table_row as _looks_like_table_row
-
-    return _looks_like_table_row(*args, **kwargs)
-
-
-def realign_markdown_tables(*args, **kwargs):
-    from agent.markdown_tables import realign_markdown_tables as _realign_markdown_tables
-
-    return _realign_markdown_tables(*args, **kwargs)
 # NOTE: `from agent.account_usage import ...` is deliberately NOT at module
 # top — it transitively pulls the OpenAI SDK chain (~230 ms cold) and is only
 # needed when the user runs `/limits`. Lazy-imported inside the handler below.
