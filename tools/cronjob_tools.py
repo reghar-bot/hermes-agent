@@ -1054,6 +1054,7 @@ def cronjob(
     monitor_url: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
+    _allow_background_run: bool = True,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
@@ -1252,8 +1253,12 @@ def cronjob(
             # batches of manual runs (#80xxx — the "stuck Telegram session"
             # incident). Falls back to inline execution when the session
             # runtime can't receive detached completions.
-            bg = _try_dispatch_background_run(
-                job, session_id=session_id, extra_prompt=extra_prompt
+            bg = (
+                _try_dispatch_background_run(
+                    job, session_id=session_id, extra_prompt=extra_prompt
+                )
+                if _allow_background_run
+                else None
             )
             if bg is not None and bg.get("dispatched"):
                 _notify_provider_jobs_changed_safe()

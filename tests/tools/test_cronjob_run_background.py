@@ -8,7 +8,8 @@ returns immediately with a handle and the run's outcome re-enters the
 conversation as a type='async_delegation' completion event.
 
 Sync fallbacks preserved:
-  - no routable session (direct Python callers, `hermes cron run`)
+  - no routable session (direct Python callers)
+  - finite `hermes cron run` CLI, even with inherited gateway routing context
   - async delivery unsupported (one-shot runners, cron child sessions)
   - dispatch pool at capacity (claim already taken — must not strand it)
 """
@@ -306,3 +307,31 @@ class TestCronjobRunToolIntegration:
         assert out["job"]["execution_success"] is True
         m_claim.assert_called_once_with("job-bg-13")
         m_run.assert_called_once()
+
+    def test_cli_forces_sync_even_with_inherited_gateway_session(self):
+        """A short-lived ``hermes cron run`` process must not strand a worker.
+
+        Terminal subprocesses spawned from a gateway turn inherit its session
+        routing environment.  The CLI marks this call finite explicitly, so an
+        ambient session key cannot make it dispatch onto a process-local daemon
+        executor that dies when the CLI exits.
+        """
+        ran = {"id": "job-bg-14", "name": "bg run", "last_status": "ok",
+               "last_error": None}
+        with _bound_session_key():
+            with patch("tools.cronjob_tools.resolve_job_ref",
+                       return_value=_job('job-bg-14')), \
+                 patch("tools.cronjob_tools._try_dispatch_background_run") as m_bg, \
+                 patch("tools.cronjob_tools._execute_job_now",
+                       return_value={"claimed": True, "success": True}) as m_sync, \
+                 patch("tools.cronjob_tools.get_job", return_value=ran):
+                out = json.loads(cronjob(
+                    action="run",
+                    job_id="job-bg-14",
+                    _allow_background_run=False,
+                ))
+
+        assert out["success"] is True
+        assert out["job"]["execution_success"] is True
+        m_bg.assert_not_called()
+        m_sync.assert_called_once()

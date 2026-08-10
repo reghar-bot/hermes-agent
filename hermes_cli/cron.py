@@ -45,6 +45,13 @@ def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None)
 def _cron_api(**kwargs):
     from tools.cronjob_tools import cronjob as cronjob_tool
 
+    if kwargs.get("action") == "run":
+        # `hermes cron run` is a finite process. A terminal launched from a
+        # gateway turn can inherit that turn's session key, but no CLI process
+        # remains alive to own its process-local async worker or deliver the
+        # completion. Force the established synchronous path instead of
+        # stranding the job's fire claim when this process exits.
+        kwargs["_allow_background_run"] = False
     return json.loads(cronjob_tool(**kwargs))
 
 
@@ -472,7 +479,10 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
         print(f"  Next run: {result['job']['next_run_at']}")
     if action == "run":
         job = result.get("job", {})
-        if job.get("executed"):
+        if job.get("execution_mode") == "background":
+            delegation_id = job.get("delegation_id") or "accepted"
+            print(f"  Running in background: {delegation_id}")
+        elif job.get("executed"):
             outcome = "succeeded" if job.get("execution_success") else "failed"
             print(f"  Ran now: {outcome}.")
         elif job.get("execution_skipped"):

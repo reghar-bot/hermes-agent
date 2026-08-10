@@ -7,6 +7,7 @@ import pytest
 
 from cron.jobs import create_job, get_job, list_jobs
 from hermes_cli import cron as cron_cli
+from hermes_cli.cli_commands_mixin import CLICommandsMixin
 from hermes_cli.cron import cron_command
 
 
@@ -234,3 +235,76 @@ def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "Failed to create job: boom" in out
+
+
+def test_cron_api_run_marks_finite_cli_call(monkeypatch):
+    captured = {}
+
+    def fake_cronjob(**kwargs):
+        captured.update(kwargs)
+        return '{"success": true, "job": {}}'
+
+    monkeypatch.setattr("tools.cronjob_tools.cronjob", fake_cronjob)
+
+    cron_cli._cron_api(action="run", job_id="job-1")
+
+    assert captured["_allow_background_run"] is False
+
+
+def test_job_action_background_dispatch_is_not_reported_as_failure(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cron_cli,
+        "_cron_api",
+        lambda **kwargs: {
+            "success": True,
+            "job": {
+                "name": "Research",
+                "next_run_at": "2026-08-11T08:00:00+02:00",
+                "executed": True,
+                "execution_mode": "background",
+                "delegation_id": "deleg_1234",
+            },
+        },
+    )
+
+    rc = cron_cli._job_action("run", "job-1", "Triggered")
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Running in background: deleg_1234" in out
+    assert "failed" not in out.lower()
+
+
+@pytest.mark.parametrize(
+    ("job_result", "expected"),
+    [
+        (
+            {
+                "executed": True,
+                "execution_mode": "background",
+                "delegation_id": "deleg_interactive",
+            },
+            "Running in background: deleg_interactive",
+        ),
+        (
+            {"executed": True, "execution_success": True},
+            "Ran now: succeeded.",
+        ),
+    ],
+)
+def test_interactive_cron_run_reports_actual_execution_mode(
+    monkeypatch, capsys, job_result, expected
+):
+    payload = {
+        "success": True,
+        "job": {"name": "Research", "next_run_at": "tomorrow", **job_result},
+    }
+    monkeypatch.setattr(
+        "tools.cronjob_tools.cronjob", lambda **kwargs: __import__("json").dumps(payload)
+    )
+
+    CLICommandsMixin()._handle_cron_command("/cron run job-1")
+
+    out = capsys.readouterr().out
+    assert expected in out
+    assert "next scheduler tick" not in out

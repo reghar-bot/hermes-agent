@@ -1772,8 +1772,18 @@ class CLICommandsMixin:
                 print(f"(^_^)b Resumed job: {result['job']['name']} ({job_id})")
                 print(f"  Next run: {result['job'].get('next_run_at')}")
             elif action == "run":
-                print(f"(^_^)b Triggered job: {result['job']['name']} ({job_id})")
-                print("  It will run on the next scheduler tick.")
+                job = result["job"]
+                print(f"(^_^)b Triggered job: {job['name']} ({job_id})")
+                if job.get("execution_mode") == "background":
+                    delegation_id = job.get("delegation_id") or "accepted"
+                    print(f"  Running in background: {delegation_id}")
+                elif job.get("executed"):
+                    outcome = "succeeded" if job.get("execution_success") else "failed"
+                    print(f"  Ran now: {outcome}.")
+                elif job.get("execution_skipped"):
+                    print(f"  {job['execution_skipped']}")
+                else:
+                    print("  It will run on the next scheduler tick.")
             else:
                 removed = result.get("removed_job", {})
                 print(f"(^_^)b Removed job: {removed.get('name', job_id)} ({job_id})")
