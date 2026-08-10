@@ -105,6 +105,9 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
 _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
+_PYTHON_EXECUTABLE_PATTERN = re.compile(
+    r"pythonw?(?:\d+(?:\.\d+)*)?(?:\.exe)?$"
+)
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
@@ -389,6 +392,18 @@ def _iter_referenced_shell_scripts(
                     yield resolved
             continue
 
+        if _PYTHON_EXECUTABLE_PATTERN.fullmatch(executable_name):
+            arguments = segment[index + 1 :]
+            for argument in arguments:
+                if argument in {"-c", "-m"}:
+                    break
+                if argument.lower().endswith(".py"):
+                    resolved = _resolve_terminal_script_path(argument, cwd)
+                    if resolved is not None:
+                        yield resolved
+                    break
+            continue
+
         # A bare "/" token is pathlib's division operator in Python sources
         # (e.g. `Path.home() / ".hermes"`), not an executable reference.
         # Resolving it walks to the filesystem root and fails the
@@ -549,6 +564,12 @@ def _contains_unsafe_gateway_action(
             if unsafe:
                 return True
         if not script_text:
+            continue
+        if resolved.suffix.lower() == ".py":
+            # Python source is not shell. Recursing through shell tokenization
+            # misreads pathlib's `/` operator and quoted paths as executables.
+            if contains_gateway_lifecycle_command(script_text):
+                return True
             continue
         # Relative references inside a script resolve against that script's
         # directory, not the original command's cwd.

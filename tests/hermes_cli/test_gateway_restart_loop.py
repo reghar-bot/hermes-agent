@@ -8,6 +8,7 @@ Covers:
 
 import json
 import os
+import sys
 from argparse import Namespace
 
 import pytest
@@ -418,6 +419,84 @@ class TestTerminalToolGatewayLifecycleGuard:
         result = json.loads(tt.terminal_tool(command=str(script)))
 
         assert result["exit_code"] == 1
+
+    def test_allows_direct_python_verifier_inside_gateway(self, monkeypatch, tmp_path):
+        """Direct Python files are scanned as Python, not recursively as shell."""
+        import tools.terminal_tool as tt
+
+        script = tmp_path / "hermes-verify-safe.py"
+        script.write_text(
+            "from pathlib import Path\n"
+            'root = Path("/tmp")\n'
+            'assert (root / "artifact.css").suffix == ".css"\n'
+        )
+        script.chmod(0o700)
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        commands = [
+            str(script),
+            f"{sys.executable} {script}",
+            f"python.exe {script}",
+            f"python3.exe {script}",
+            f"pythonw.exe {script}",
+        ]
+        for command in commands:
+            result = json.loads(tt.terminal_tool(command=command))
+            assert result["exit_code"] == 0
+
+        assert calls == commands
+
+    def test_blocks_direct_python_with_literal_lifecycle_command(
+        self, monkeypatch, tmp_path
+    ):
+        import tools.terminal_tool as tt
+
+        script = tmp_path / "unsafe.py"
+        script.write_text('import os\nos.system("hermes gateway restart")\n')
+        script.chmod(0o700)
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+
+        commands = [
+            str(script),
+            f"{sys.executable} {script}",
+            f"python.exe {script}",
+            f"python3.exe {script}",
+            f"pythonw.exe {script}",
+        ]
+        for command in commands:
+            result = json.loads(tt.terminal_tool(command=command))
+            assert result["exit_code"] == 1
+            assert "Blocked" in result["error"]
+
+    def test_python_c_payload_does_not_scan_interpreter_binary(
+        self, monkeypatch
+    ):
+        """A Python -c payload must not cause the interpreter binary to be decoded."""
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        command = f'{sys.executable} -c "print(1)"'
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls == [command]
 
     def test_launchctl_submit_parser_handles_shell_quoting(self, monkeypatch):
         import tools.terminal_tool as tt
