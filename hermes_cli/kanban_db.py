@@ -338,6 +338,7 @@ def _fire_dispatch_tick_hook(
             result.stale,
             result.timed_out,
             result.auto_blocked,
+            result.capability_blocked,
             result.rate_limited,
             result.auto_assigned_default,
             result.respawn_guarded,
@@ -8053,6 +8054,13 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    capability_blocked: list[tuple[str, str, list[str]]] = field(default_factory=list)
+    """Tasks rejected by the profile/skill routing preflight.
+
+    Each entry is ``(task_id, assignee, missing_skills)``. No worker process
+    was launched and the failure counter was not incremented; live dispatches
+    move the task to a typed ``capability`` block, while dry-runs only report
+    the incompatibility."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -9887,6 +9895,128 @@ def dispatch_once(
     return result
 
 
+def _profile_available_skill_names(profile_name: str) -> Optional[set[str]]:
+    """Return CLI-loadable skill names for one profile, without loading them.
+
+    ``None`` means the profile home could not be resolved. The dispatcher has
+    a separate ``profile_exists`` gate, so this case is primarily useful for
+    injected test profiles and unusual launchers; the established spawn path
+    remains authoritative there. For a real profile whose inventory scan
+    fails, return an empty set and fail closed.
+
+    The metadata-only scan deliberately avoids ``skill_view`` and
+    ``build_preloaded_skills_prompt``: both read full skill bodies and the
+    latter increments Curator usage. A routing check must not pretend a skill
+    was used or trigger skill setup side effects.
+    """
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+
+        profile_home = resolve_profile_env(profile_name)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        _log.warning(
+            "kanban skill preflight: cannot resolve profile %r: %s",
+            profile_name,
+            exc,
+        )
+        return set()
+
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(profile_home)
+    try:
+        from tools.skills_tool import _parse_frontmatter, _skills_dir
+        from agent.skill_utils import (
+            get_disabled_skill_names,
+            get_external_skills_dirs,
+            iter_skill_index_files,
+            skill_matches_platform,
+        )
+
+        disabled = get_disabled_skill_names(platform="cli")
+        candidates: dict[str, set[str]] = {}
+        search_dirs = [_skills_dir(), *get_external_skills_dirs()]
+        for search_dir in search_dirs:
+            if not search_dir.exists():
+                continue
+            for skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+                try:
+                    frontmatter, _ = _parse_frontmatter(
+                        skill_md.read_text(
+                            encoding="utf-8-sig", errors="replace"
+                        )[:4000]
+                    )
+                except Exception:
+                    continue
+                name = str(
+                    frontmatter.get("name") or skill_md.parent.name
+                ).strip()
+                if (
+                    name
+                    and name not in disabled
+                    and skill_matches_platform(frontmatter)
+                ):
+                    candidates.setdefault(name, set()).add(
+                        str(skill_md.resolve(strict=False))
+                    )
+        # Explicit ``--skills`` loads bypass offer-time ``environments``
+        # filters (notably ``environments: [kanban]`` on sdlc-review), but
+        # they refuse ambiguous local/external collisions. Mirror both rules.
+        available = {
+            name for name, paths in candidates.items() if len(paths) == 1
+        }
+
+        return available
+    except Exception as exc:
+        _log.warning(
+            "kanban skill preflight: inventory scan failed for profile %r: %s",
+            profile_name,
+            exc,
+        )
+        return set()
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _decode_required_skills(raw: Any) -> list[str]:
+    """Normalize a task-row skills value into unique, ordered names."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        raw = [raw]
+    return list(
+        dict.fromkeys(
+            name
+            for item in raw
+            if (name := str(item or "").strip())
+        )
+    )
+
+
+def _capability_preflight_reason(
+    profile_name: str,
+    missing_skills: list[str],
+    *,
+    lane: str,
+) -> str:
+    noun = "skill" if len(missing_skills) == 1 else "skills"
+    return (
+        f"routing preflight: profile {profile_name!r} cannot run the {lane} "
+        f"lane because required {noun} are unavailable or disabled: "
+        f"{', '.join(missing_skills)}"
+    )
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -10034,7 +10164,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, skills FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10043,7 +10173,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, skills FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -10111,6 +10241,26 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    # One metadata scan per assigned profile per tick. Profile skill trees are
+    # stable over a dispatch pass, and rescanning 90+ skill manifests for every
+    # queued task adds latency without improving correctness.
+    _skill_inventory_by_profile: dict[str, Optional[set[str]]] = {}
+
+    def _missing_skills(profile_name: str, required: list[str]) -> list[str]:
+        if not required:
+            return []
+        if profile_name not in _skill_inventory_by_profile:
+            _skill_inventory_by_profile[profile_name] = (
+                _profile_available_skill_names(profile_name)
+            )
+        available = _skill_inventory_by_profile[profile_name]
+        # An unresolved home is already handled by the existing profile gate.
+        # Preserve compatibility with injected profile resolvers instead of
+        # inventing a second, contradictory "missing profile" outcome here.
+        if available is None:
+            return []
+        return [name for name in required if name not in available]
+
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
@@ -10180,6 +10330,22 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        required_skills = _decode_required_skills(row["skills"])
+        missing_skills = _missing_skills(row_assignee, required_skills)
+        if missing_skills:
+            blocked = dry_run or block_task(
+                conn,
+                row["id"],
+                reason=_capability_preflight_reason(
+                    row_assignee, missing_skills, lane="ready"
+                ),
+                kind="capability",
+            )
+            if blocked:
+                result.capability_blocked.append(
+                    (row["id"], row_assignee, missing_skills)
+                )
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -10328,6 +10494,38 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        required_skills = list(
+            dict.fromkeys(
+                [*_decode_required_skills(row["skills"]), "sdlc-review"]
+            )
+        )
+        missing_skills = _missing_skills(row["assignee"], required_skills)
+        if missing_skills:
+            if dry_run:
+                result.capability_blocked.append(
+                    (row["id"], row["assignee"], missing_skills)
+                )
+            else:
+                # ``block_task`` intentionally transitions only ready/running
+                # tasks. Claim the review lane atomically, then close that
+                # synthetic reviewer run as a capability block. No subprocess
+                # is launched and no failure retry is consumed.
+                incompatible = claim_review_task(
+                    conn, row["id"], ttl_seconds=ttl_seconds
+                )
+                if incompatible is not None and block_task(
+                    conn,
+                    incompatible.id,
+                    reason=_capability_preflight_reason(
+                        row["assignee"], missing_skills, lane="review"
+                    ),
+                    kind="capability",
+                    expected_run_id=incompatible.current_run_id,
+                ):
+                    result.capability_blocked.append(
+                        (row["id"], row["assignee"], missing_skills)
+                    )
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)

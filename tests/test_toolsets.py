@@ -63,6 +63,11 @@ class TestResolveToolset:
         tools = resolve_toolset("web")
         assert set(tools) == {"web_search", "web_extract"}
 
+    def test_readonly_file_toolset_cannot_mutate_files(self):
+        tools = set(resolve_toolset("file_readonly"))
+        assert tools == {"read_file", "search_files"}
+        assert tools.isdisjoint({"write_file", "patch"})
+
     def test_composite_toolset(self):
         tools = resolve_toolset("debugging")
         assert "terminal" in tools
@@ -355,4 +360,3 @@ class TestResolveToolsetMemo:
         second = resolve_toolset("hermes-cli", include_registry=False)
         assert first == second
         assert first  # non-empty sanity
-

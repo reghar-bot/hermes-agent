@@ -2675,6 +2675,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "timed_out": res.timed_out,
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
+            "capability_blocked": [
+                {
+                    "task_id": tid,
+                    "assignee": who,
+                    "missing_skills": missing,
+                }
+                for (tid, who, missing) in res.capability_blocked
+            ],
             "promoted": res.promoted,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
@@ -2702,6 +2710,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
+    print(f"Capability-blocked: {len(res.capability_blocked)}")
+    for tid, who, missing in res.capability_blocked:
+        tag = " (dry)" if args.dry_run else ""
+        print(
+            f"  - {tid}  ->  {who}: missing {', '.join(missing)}{tag}"
+        )
     print(f"Promoted:     {res.promoted}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
@@ -2823,7 +2837,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return
         did_work = (
             res.reclaimed or res.crashed or res.timed_out or res.promoted
-            or res.spawned or res.auto_blocked or res.stale
+            or res.spawned or res.auto_blocked or res.capability_blocked
+            or res.stale
         )
         if did_work:
             print(
@@ -2831,7 +2846,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 f"reclaimed={res.reclaimed} crashed={len(res.crashed)} "
                 f"timed_out={len(res.timed_out)} stale={len(res.stale)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
-                f"auto_blocked={len(res.auto_blocked)}",
+                f"auto_blocked={len(res.auto_blocked)} "
+                f"capability_blocked={len(res.capability_blocked)}",
                 flush=True,
             )
 
