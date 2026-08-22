@@ -2880,22 +2880,26 @@ def _cron_delivery_profile(job: dict) -> Optional[str]:
     return None
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
-    """Deliver through the configured notification-owner profile, if any."""
+class _CronDeliveryProfileUnavailable(RuntimeError):
+    """Raised when a configured notification-owner profile cannot be loaded."""
+
+
+@contextlib.contextmanager
+def _cron_delivery_profile_scope(job: dict):
+    """Scope gateway config and secrets to the job's delivery owner profile."""
     delivery_profile = _cron_delivery_profile(job)
     if not delivery_profile or delivery_profile == "default":
-        return _deliver_result_active_profile(
-            job, content, adapters=adapters, loop=loop
-        )
+        yield False
+        return
 
     try:
         from hermes_cli.profiles import resolve_profile_env
 
         profile_home = resolve_profile_env(delivery_profile)
     except Exception as exc:
-        return (
+        raise _CronDeliveryProfileUnavailable(
             f"cron delivery profile '{delivery_profile}' is unavailable: {exc}"
-        )
+        ) from exc
 
     from agent.secret_scope import (
         build_profile_secret_scope,
@@ -2910,14 +2914,28 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     home_token = set_hermes_home_override(profile_home)
     secret_token = set_secret_scope(build_profile_secret_scope(profile_home))
     try:
-        # Runtime adapters belong to the scheduler's gateway.  A different
-        # delivery profile must use its own standalone transport rather than
-        # accidentally sending through an adapter authenticated as another
-        # profile.
-        return _deliver_result_active_profile(job, content, adapters=None, loop=None)
+        yield True
     finally:
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
+
+
+def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+    """Deliver through the configured notification-owner profile, if any."""
+    try:
+        with _cron_delivery_profile_scope(job) as routed:
+            if routed:
+                # Runtime adapters belong to the scheduler's gateway.  A
+                # different delivery profile must use its own standalone
+                # transport rather than accidentally sending through an
+                # adapter authenticated as another profile.
+                adapters = None
+                loop = None
+            return _deliver_result_active_profile(
+                job, content, adapters=adapters, loop=loop
+            )
+    except _CronDeliveryProfileUnavailable as exc:
+        return str(exc)
 
 
 def _deliver_result_active_profile(
@@ -4866,11 +4884,19 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
             try:
                 from gateway.config import load_gateway_config
 
-                gateway_config = load_gateway_config()
+                # Validate against the same notification-owner profile that
+                # will perform the final send. Without this scope, a healthy
+                # centralized Telegram profile is incorrectly rejected when
+                # the scheduler's execution profile intentionally has no
+                # messaging credentials.
+                with _cron_delivery_profile_scope(job):
+                    gateway_config = load_gateway_config()
                 connected = {
                     p.value for p in gateway_config.get_connected_platforms()
                 }
                 connected |= _relay_fronted_delivery_platforms(connected)
+            except _CronDeliveryProfileUnavailable as exc:
+                return str(exc)
             except Exception:
                 logger.debug(
                     "preflight: gateway config unavailable — skipping "

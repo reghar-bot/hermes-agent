@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from cron import scheduler
@@ -69,3 +70,41 @@ def test_default_delivery_profile_preserves_live_adapter_path():
     deliver.assert_called_once_with(
         {"id": "job-1"}, "hello", adapters=adapters, loop=loop
     )
+
+
+def test_preflight_checks_named_delivery_profile_gateway(tmp_path):
+    gateway_config = SimpleNamespace(
+        get_connected_platforms=lambda: [SimpleNamespace(value="telegram")]
+    )
+    secret_token = object()
+    home_token = object()
+
+    with (
+        patch.object(scheduler, "_cron_delivery_profile", return_value="telegram-lite"),
+        patch("hermes_cli.profiles.resolve_profile_env", return_value=tmp_path),
+        patch("agent.secret_scope.build_profile_secret_scope", return_value=object()),
+        patch("agent.secret_scope.set_secret_scope", return_value=secret_token),
+        patch("agent.secret_scope.reset_secret_scope") as reset_secret,
+        patch("hermes_constants.set_hermes_home_override", return_value=home_token),
+        patch("hermes_constants.reset_hermes_home_override") as reset_home,
+        patch("gateway.config.load_gateway_config", return_value=gateway_config),
+        patch.object(scheduler, "_is_known_delivery_platform", return_value=True),
+    ):
+        assert scheduler._preflight_check_delivery({"deliver": "telegram"}) is None
+
+    reset_secret.assert_called_once_with(secret_token)
+    reset_home.assert_called_once_with(home_token)
+
+
+def test_preflight_missing_delivery_profile_fails_closed():
+    with (
+        patch.object(scheduler, "_cron_delivery_profile", return_value="missing"),
+        patch(
+            "hermes_cli.profiles.resolve_profile_env",
+            side_effect=FileNotFoundError("not found"),
+        ),
+        patch.object(scheduler, "_is_known_delivery_platform", return_value=True),
+    ):
+        result = scheduler._preflight_check_delivery({"deliver": "telegram"})
+
+    assert "delivery profile 'missing' is unavailable" in result
