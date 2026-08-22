@@ -2856,7 +2856,73 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _cron_delivery_profile(job: dict) -> Optional[str]:
+    """Return the named profile that owns outbound cron delivery.
+
+    Cron execution remains scoped to the scheduler's active profile.  This
+    optional routing layer only changes which profile supplies gateway config
+    and credentials for the final outbound send.  It lets an installation
+    keep one messaging owner (for example ``telegram-lite``) without enabling
+    the same polling adapter on every profile that runs scheduled work.
+    """
+    explicit = str(job.get("delivery_profile") or "").strip()
+    if explicit:
+        return explicit
+    try:
+        cfg = load_config()
+        cron_cfg = cfg.get("cron") or {}
+        if isinstance(cron_cfg, dict):
+            configured = str(cron_cfg.get("delivery_profile") or "").strip()
+            if configured:
+                return configured
+    except Exception:
+        logger.debug("Could not resolve cron.delivery_profile", exc_info=True)
+    return None
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+    """Deliver through the configured notification-owner profile, if any."""
+    delivery_profile = _cron_delivery_profile(job)
+    if not delivery_profile or delivery_profile == "default":
+        return _deliver_result_active_profile(
+            job, content, adapters=adapters, loop=loop
+        )
+
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+
+        profile_home = resolve_profile_env(delivery_profile)
+    except Exception as exc:
+        return (
+            f"cron delivery profile '{delivery_profile}' is unavailable: {exc}"
+        )
+
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    home_token = set_hermes_home_override(profile_home)
+    secret_token = set_secret_scope(build_profile_secret_scope(profile_home))
+    try:
+        # Runtime adapters belong to the scheduler's gateway.  A different
+        # delivery profile must use its own standalone transport rather than
+        # accidentally sending through an adapter authenticated as another
+        # profile.
+        return _deliver_result_active_profile(job, content, adapters=None, loop=None)
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
+def _deliver_result_active_profile(
+    job: dict, content: str, adapters=None, loop=None
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
