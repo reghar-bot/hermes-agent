@@ -364,18 +364,71 @@ def _pid_alive(pid: Optional[int]) -> bool:
 UNVERIFIED_WORKER_FINGERPRINT = "unverified"
 
 
+def _on_darwin() -> bool:
+    return sys.platform == "darwin"
+
+
+def _darwin_raw_create_time(pid: int) -> Optional[float]:
+    """Unadjusted process create_time (epoch seconds) on macOS, or ``None``.
+
+    The kernel's start time (``p_starttime``) is fixed for the life of the process, but
+    ``psutil.Process.create_time()`` shifts it by (kern.boottime when THAT process imported psutil) -
+    (kern.boottime now), and kern.boottime itself drifts under NTP (2 s in 30 min, 3 s seen). Two
+    processes therefore read different create_times for the same live PID. Measured on psutil 7.2.2:
+    the raw value stayed identical across 30 min while boottime moved 2 s. This is a private psutil
+    API (``_psplatform.cext`` / ``kinfo_proc_map``, the read ``create_time`` itself makes before
+    ``adjust_proc_create_time``), so any failure returns ``None`` and callers use the legacy reading."""
+    try:
+        import psutil  # type: ignore
+        plat = psutil._psplatform
+        return float(plat.cext.proc_kinfo_oneshot(int(pid))[plat.kinfo_proc_map["ctime"]])
+    except Exception:
+        return None
+
+
 def _process_fingerprint(pid: int) -> Optional[str]:
     """Restart-stable identity of a live process: ``"<instantiation epoch>|<start time>"``. The start
     time alone (``/proc/<pid>/stat`` field 22 on Linux) is clock ticks since THIS boot, so a row that
     survives a reboot could match an unrelated process with the same PID and the same tick value;
     ``gateway.drain_control.current_instantiation_epoch`` (``boot_id`` + PID-1 start) changes on every
-    reboot / container recreate, so the composed value never survives one. ``None`` when unreadable."""
+    reboot / container recreate, so the composed value never survives one. ``None`` when unreadable.
+
+    On macOS the epoch is ``""`` and the start is ``"r:<raw create_time centiseconds>"``: a wall-clock
+    start differs across reboots by itself, and the raw value (unlike psutil's adjusted one) does not
+    drift between processes (see ``_darwin_raw_create_time``). If it cannot be read the legacy
+    adjusted wall-clock start is used."""
     from gateway.drain_control import current_instantiation_epoch
     from gateway.status import get_process_start_time
+    if _on_darwin():
+        raw = _darwin_raw_create_time(pid)
+        if raw is not None:
+            return f"{current_instantiation_epoch()}|r:{round(raw * 100)}"
     start = get_process_start_time(int(pid))
     if start is None:
         return None
     return f"{current_instantiation_epoch()}|{start}"
+
+
+def _fingerprint_start_matches(pid: int, recorded: str) -> bool:
+    """Does the live ``pid`` still match the start component ``recorded`` by ``_process_fingerprint``?
+    Compared in the recorded format, within ``START_TIME_DRIFT_TOLERANCE``; unreadable = no match."""
+    from gateway.status import get_process_start_time, start_time_fingerprints_match
+    try:
+        if recorded.startswith("r:"):
+            raw = _darwin_raw_create_time(pid) if _on_darwin() else None
+            return raw is not None and start_time_fingerprints_match(int(recorded[2:]), round(raw * 100))
+        rec = int(recorded)
+        current = get_process_start_time(pid)
+        if current is None:
+            return False
+        if start_time_fingerprints_match(rec, current):
+            return True
+        # Legacy darwin rows were written from psutil's adjusted create_time, whose shift depends on
+        # the writer's import time: the raw reading is the other candidate.
+        raw = _darwin_raw_create_time(pid) if _on_darwin() else None
+        return raw is not None and start_time_fingerprints_match(rec, round(raw * 100))
+    except (TypeError, ValueError):
+        return False
 
 
 def _worker_alive(pid: Optional[int], started_at) -> bool:
@@ -396,14 +449,17 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
 def _pid_recycled(pid: Optional[int], started_at) -> bool:
     """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
     longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
-    recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
-    boot witness was added) compares the start time only."""
+    recycled; the UNVERIFIED marker is always foreign. The epoch must match exactly; the start time is
+    compared with drift tolerance (``_fingerprint_start_matches``). An integer fingerprint (rows written
+    before the boot witness was added) compares the start time only."""
     if started_at is None or not pid:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
     if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
+        from gateway.drain_control import current_instantiation_epoch
+        epoch, _, recorded = started_at.partition("|")
+        return epoch != current_instantiation_epoch() or not _fingerprint_start_matches(int(pid), recorded)
     from gateway.status import _start_times_agree, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:
@@ -1139,7 +1195,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, "
+            "(SELECT r.started_at FROM task_runs r WHERE r.id = tasks.current_run_id) AS run_started_at "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1149,8 +1206,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             if not lock.startswith(host_prefix):
                 continue
             # Launch-window grace so a freshly-spawned worker isn't reclaimed
-            # before its PID is visible on /proc.
-            started_at = _kb._row_get(row, "started_at")
+            # before its PID is visible on /proc. Keyed on the CURRENT run: tasks.started_at is the first
+            # claim ever, so a retried run would otherwise get no grace.
+            started_at = _kb._row_get(row, "run_started_at")
+            if started_at is None:
+                started_at = _kb._row_get(row, "started_at")
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
