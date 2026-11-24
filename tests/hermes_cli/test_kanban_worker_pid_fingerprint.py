@@ -149,3 +149,152 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"
+
+
+# --- macOS: psutil's adjusted create_time differs per reading process ------------------------------
+# Measured on a real Mac (psutil 7.2.2): the raw kernel create_time of a process is FIXED, kern.boottime
+# drifts (2 s in 30 min), and psutil's create_time() shifts the raw value by the reading process's
+# (INIT_BOOT_TIME - boot_time()), so two processes disagree about the same live PID.
+
+_RAW_CTIME = 1_800_000_000.34
+_BOOT = 1_799_000_000.0
+
+
+class _FakeMacPsutil:
+    """Shaped like psutil 7.2.2's ``_psosx``: ``cext.proc_kinfo_oneshot`` + ``kinfo_proc_map``."""
+
+    kinfo_proc_map = {"ppid": 0, "ctime": 1}
+
+    class _Cext:
+        def __init__(self, world):
+            self.world = world
+
+        def proc_kinfo_oneshot(self, pid):
+            if self.world.raw_error:
+                raise OSError("boom")
+            return (1, self.world.raw_ctime)
+
+    def __init__(self, world, real):
+        self.cext = self._Cext(world)
+        self._real = real  # everything else psutil asks of its platform module (pid_exists, ...)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _World:
+    """Fake macOS host. The raw create_time never changes; ``reader(init_boot, boot_now)`` selects which
+    process is reading (its psutil import-time boottime and the current kern.boottime)."""
+
+    def __init__(self):
+        self.raw_ctime = _RAW_CTIME
+        self.raw_error = False
+        self.init_boot = _BOOT
+        self.boot_now = _BOOT
+
+    def reader(self, init_boot, boot_now):
+        self.init_boot, self.boot_now = float(init_boot), float(boot_now)
+
+    def adjusted(self):  # psutil._psosx.adjust_proc_create_time, verbatim logic
+        diff = self.init_boot - self.boot_now
+        if abs(diff) < 1:
+            return self.raw_ctime
+        return self.raw_ctime - diff if diff < 0 else self.raw_ctime + diff
+
+
+@pytest.fixture
+def darwin_world(monkeypatch):
+    import gateway.status as status
+    import psutil
+
+    w = _World()
+    monkeypatch.setattr(kbd, "_on_darwin", lambda: True, raising=False)
+    monkeypatch.setattr(psutil, "_psplatform", _FakeMacPsutil(w, psutil._psplatform), raising=False)
+    monkeypatch.setattr(status, "get_process_start_time", lambda pid: round(w.adjusted() * 100))
+    monkeypatch.setattr("gateway.drain_control.current_instantiation_epoch", lambda: "")
+    return w
+
+
+@pytest.mark.parametrize("drift", [1, 5, 30])
+def test_darwin_boottime_drift_does_not_recycle_a_live_worker(board, darwin_world, drift):
+    """Recorded by a process that imported psutil at boottime B; checked later by one that imported it
+    ``drift`` s after kern.boottime moved. Same live PID: it must not be reclaimed (a duplicate worker
+    would be spawned)."""
+    conn = board
+    recorded = kbd._process_fingerprint(os.getpid())
+    assert recorded == f"|r:{round(_RAW_CTIME * 100)}"
+    tid = _claimed_running(conn, pid=os.getpid(), started_at=recorded)
+    darwin_world.reader(_BOOT + drift, _BOOT + drift)  # a fresh process, boottime has drifted
+    assert kbd._pid_recycled(os.getpid(), recorded) is False
+    darwin_world.reader(_BOOT, _BOOT + drift)  # the recording process itself, still running
+    assert kbd._pid_recycled(os.getpid(), recorded) is False
+    assert kbd._worker_alive(os.getpid(), recorded) is True
+    sweep = kbd._reclaim_dead_workers(conn)
+    assert sweep.crash_details == []
+    assert kb.get_task(conn, tid).status == "running"
+
+
+def test_darwin_raw_start_far_off_is_recycled(darwin_world):
+    """A different process on the same PID (started 10 s later) is foreign."""
+    recorded = kbd._process_fingerprint(os.getpid())
+    darwin_world.raw_ctime += 10
+    assert kbd._pid_recycled(os.getpid(), recorded) is True
+
+
+def test_epoch_mismatch_is_recycled_even_when_start_matches(darwin_world, monkeypatch):
+    recorded = kbd._process_fingerprint(os.getpid())
+    monkeypatch.setattr("gateway.drain_control.current_instantiation_epoch", lambda: "other-boot:1")
+    assert kbd._pid_recycled(os.getpid(), recorded) is True
+
+
+def test_darwin_unreadable_current_reading_is_recycled(darwin_world):
+    recorded = kbd._process_fingerprint(os.getpid())
+    darwin_world.raw_error = True
+    assert kbd._pid_recycled(os.getpid(), recorded) is True
+
+
+@pytest.mark.parametrize("which,delta_s,recycled", [
+    ("adjusted", 0.0, False), ("adjusted", 1.5, False), ("adjusted", 10, True),
+    ("raw", 1.5, False), ("raw", 10, True),
+])
+def test_legacy_wallclock_row_tolerates_adjusted_or_raw_reading(darwin_world, which, delta_s, recycled):
+    """Rows written before the raw format: ``|<wall-clock cs>``. Accepted within 2 s of either psutil's
+    adjusted reading or the raw one (the writer's adjustment is unknown)."""
+    darwin_world.reader(_BOOT + 3, _BOOT)  # we read an adjusted value 3 s off the raw one
+    base = darwin_world.adjusted() if which == "adjusted" else darwin_world.raw_ctime
+    assert abs(darwin_world.adjusted() - darwin_world.raw_ctime) >= 2.9
+    assert kbd._pid_recycled(os.getpid(), f"|{round((base + delta_s) * 100)}") is recycled
+
+
+def test_raw_create_time_wrapper_reads_the_psutil_7_2_2_attribute_path(darwin_world):
+    """Exercises ``psutil._psplatform.cext.proc_kinfo_oneshot(pid)[kinfo_proc_map['ctime']]`` against a
+    fake shaped like psutil 7.2.2's ``_psosx`` (runs on every host)."""
+    assert kbd._darwin_raw_create_time(os.getpid()) == _RAW_CTIME
+
+
+@pytest.mark.platforms("macos")
+def test_private_psutil_api_we_rely_on_exists_on_macos():
+    """On a real Mac the private names ``_darwin_raw_create_time`` reads must exist; a psutil upgrade
+    that drops them silently degrades to the legacy fingerprint, and this says so."""
+    import psutil
+
+    assert "ctime" in psutil._psplatform.kinfo_proc_map
+    raw = kbd._darwin_raw_create_time(os.getpid())
+    assert raw is not None and raw > 0
+
+
+@pytest.mark.parametrize("breakage", ["missing", "raises"])
+def test_private_psutil_failure_falls_back_to_legacy_format(darwin_world, monkeypatch, breakage):
+    import gateway.status as status
+    import psutil
+
+    if breakage == "missing":
+        monkeypatch.delattr(psutil, "_psplatform")
+    else:
+        darwin_world.raw_error = True
+    assert kbd._darwin_raw_create_time(os.getpid()) is None
+    fp = kbd._process_fingerprint(os.getpid())
+    assert fp is not None and fp.split("|", 1)[1] == str(status.get_process_start_time(os.getpid()))
+    assert "r:" not in fp
+    assert kbd._pid_recycled(os.getpid(), fp) is False
+
