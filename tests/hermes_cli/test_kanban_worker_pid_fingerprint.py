@@ -298,3 +298,19 @@ def test_private_psutil_failure_falls_back_to_legacy_format(darwin_world, monkey
     assert "r:" not in fp
     assert kbd._pid_recycled(os.getpid(), fp) is False
 
+
+def test_retried_run_gets_launch_grace_from_its_own_start(board, monkeypatch):
+    """tasks.started_at is the FIRST claim ever; a retry whose worker PID is not yet visible must still
+    get the launch grace measured from the current run's start, not be reclaimed as crashed."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "30")
+    conn = board
+    tid = _claimed_running(conn, pid=os.getpid(), started_at=1)  # foreign fingerprint = "dead" worker
+    assert kbd._reclaim_dead_workers(conn).crash_details  # old run: outside grace, reclaimed
+    kb.claim_task(conn, tid)  # retry: new run, tasks.started_at stays hours old
+    kbd._set_worker_pid(conn, tid, os.getpid())
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET worker_started_at = 1, started_at = ? WHERE id = ?",
+                     (int(time.time()) - 3600, tid))
+    assert kb.get_task(conn, tid).status == "running"
+    assert kbd._reclaim_dead_workers(conn).crash_details == []
+    assert kb.get_task(conn, tid).status == "running"

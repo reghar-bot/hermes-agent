@@ -1195,7 +1195,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, "
+            "(SELECT r.started_at FROM task_runs r WHERE r.id = tasks.current_run_id) AS run_started_at "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1205,8 +1206,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             if not lock.startswith(host_prefix):
                 continue
             # Launch-window grace so a freshly-spawned worker isn't reclaimed
-            # before its PID is visible on /proc.
-            started_at = _kb._row_get(row, "started_at")
+            # before its PID is visible on /proc. Keyed on the CURRENT run: tasks.started_at is the first
+            # claim ever, so a retried run would otherwise get no grace.
+            started_at = _kb._row_get(row, "run_started_at")
+            if started_at is None:
+                started_at = _kb._row_get(row, "started_at")
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
